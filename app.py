@@ -86,16 +86,34 @@ with tab_check:
     site = st.text_input("ชื่อโครงการ / โกดัง", placeholder="เช่น อรุณสุนทรี มินิแฟคตอรี่")
     notes = st.text_area("บันทึกเพิ่มเติม", placeholder="เช่น มีรอยน้ำ น้ำขังหน้าประตู เจ้าของแจ้งประวัติน้ำท่วม")
     st.subheader("1. บันทึกตำแหน่งจากโทรศัพท์")
+    st.info("กดปุ่มขอตำแหน่งใหม่ แล้วรอให้ค่าพิกัด/ความแม่นยำอัปเดตทุกครั้งก่อนบันทึก A, B หรือ C")
     geo = streamlit_geolocation()
     if geo and geo.get("latitude") is not None and geo.get("longitude") is not None:
-        st.session_state.last_geo = {
+        new_geo = {
             "lat": float(geo["latitude"]), "lon": float(geo["longitude"]),
-            "accuracy_m": geo.get("accuracy"),
+            "accuracy_m": float(geo["accuracy"]) if geo.get("accuracy") is not None else None,
             "captured_at": datetime.now(timezone.utc).isoformat()
         }
+        previous_geo = st.session_state.last_geo
+        # Do not overwrite a better current fix with a clearly worse fix.
+        if previous_geo is None or (
+            (new_geo["accuracy_m"] is not None and previous_geo.get("accuracy_m") is not None
+             and new_geo["accuracy_m"] <= previous_geo["accuracy_m"])
+            or (new_geo["accuracy_m"] is not None and previous_geo.get("accuracy_m") is None)
+            or (new_geo["accuracy_m"] is None and previous_geo.get("accuracy_m") is None)
+        ):
+            st.session_state.last_geo = new_geo
         acc = st.session_state.last_geo.get("accuracy_m")
-        st.success(f"พิกัดล่าสุด {geo['latitude']:.6f}, {geo['longitude']:.6f}" +
-                   (f" • ความแม่นยำแนวราบ ±{acc:.0f} ม." if acc is not None else ""))
+        st.success(f"พิกัดพร้อมใช้ {st.session_state.last_geo['lat']:.6f}, {st.session_state.last_geo['lon']:.6f}" +
+                   (f" • ความแม่นยำแนวราบ ±{acc:.0f} ม." if acc is not None else " • ไม่ทราบค่าความแม่นยำ"))
+        if acc is None:
+            st.warning("เบราว์เซอร์ไม่ได้ส่งค่าความแม่นยำ GPS มา ควรตรวจตำแหน่งบนแผนที่ก่อนบันทึก")
+        elif acc > 50:
+            st.error(f"GPS ยังคลาดเคลื่อนสูง (±{acc:.0f} ม.) ไม่ควรใช้พิกัดนี้ระบุจุดตรวจโกดัง ให้กดขอตำแหน่งใหม่และรอให้แม่นยำขึ้น")
+        elif acc > 20:
+            st.warning(f"GPS คลาดเคลื่อนประมาณ ±{acc:.0f} ม. ควรรอให้ดีขึ้นและตรวจตำแหน่งกับแผนที่ก่อนบันทึก")
+        else:
+            st.caption("ค่าความแม่นยำแนวราบดีขึ้น แต่ยังไม่ใช่การวัดระดับความสูงของพื้น")
 
     cols = st.columns(3)
     for i, k in enumerate(["A", "B", "C"]):
@@ -105,12 +123,24 @@ with tab_check:
             if p:
                 st.caption(f"{p['lat']:.6f}, {p['lon']:.6f}")
             if st.button(f"บันทึก {k}", key=f"save_{k}", use_container_width=True):
-                if st.session_state.last_geo:
-                    st.session_state.points[k] = dict(st.session_state.last_geo)
-                    st.session_state.elevations = None
-                    st.rerun()
+                fix = st.session_state.last_geo
+                if not fix:
+                    st.error("กดขอตำแหน่ง GPS ก่อน")
+                elif fix.get("accuracy_m") is None:
+                    st.error("ยังไม่มีค่าความแม่นยำ GPS จึงยังไม่บันทึก กรุณาขอตำแหน่งใหม่")
+                elif fix["accuracy_m"] > 50:
+                    st.error(f"ยังไม่บันทึก {k}: GPS คลาดเคลื่อน ±{fix['accuracy_m']:.0f} ม. ให้ขอตำแหน่งใหม่และรอให้ต่ำกว่า 50 ม. ก่อน")
                 else:
-                    st.error("ขอตำแหน่ง GPS ก่อน")
+                    same_as = [other for other in "ABC" if other != k and st.session_state.points.get(other)
+                               and abs(st.session_state.points[other]["lat"] - fix["lat"]) < 0.00015
+                               and abs(st.session_state.points[other]["lon"] - fix["lon"]) < 0.00015]
+                    if same_as:
+                        st.error(f"ยังไม่บันทึก {k}: พิกัดนี้ใกล้กับจุด {', '.join(same_as)} มาก ตรวจว่าคุณเดินไปตำแหน่งใหม่และขอ GPS ใหม่แล้วหรือยัง")
+                    else:
+                        st.session_state.points[k] = dict(fix)
+                        st.session_state.elevations = None
+                        st.success(f"บันทึกจุด {k} แล้ว")
+                        st.rerun()
             if p and st.button(f"ล้าง {k}", key=f"clear_{k}", use_container_width=True):
                 st.session_state.points[k] = None
                 st.session_state.elevations = None
@@ -140,6 +170,7 @@ with tab_check:
                 if not values or len(values) != 3:
                     raise ValueError("ข้อมูลระดับความสูงไม่ครบ")
                 st.session_state.elevations = dict(zip("ABC", map(float, values)))
+                st.info("ระดับนี้มาจากแบบจำลองภูมิประเทศ ไม่ใช่ค่าระดับพื้นจริง และอาจไม่ละเอียดพอสำหรับส่วนต่างระดับ 10–50 ซม.")
             except Exception as e:
                 st.error(f"ดึงข้อมูลไม่สำเร็จ: {e}")
 
