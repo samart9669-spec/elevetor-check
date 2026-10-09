@@ -50,7 +50,7 @@ def db_read():
     url, key = supabase_config()
     if not url or not key:
         return None, "ยังไม่ได้ตั้งค่า Supabase"
-    endpoint = f"{url}/rest/v1/warehouse_sites?select=id,created_at,site,risk_score,risk_label,notes&order=created_at.desc"
+    endpoint = f"{url}/rest/v1/warehouse_sites?select=id,created_at,site,notes,risk_score,risk_label,points,risk_checks,elevations_model_m&order=created_at.desc"
     try:
         r = requests.get(endpoint, headers=supabase_headers(key), timeout=20)
         if r.status_code != 200:
@@ -189,12 +189,91 @@ with tab_history:
     elif not rows:
         st.info("ยังไม่มีรายการบันทึก")
     else:
-        df = pd.DataFrame(rows)
-        if "created_at" in df:
-            df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
-        st.dataframe(df, hide_index=True, use_container_width=True)
-        st.download_button("ส่งออก CSV", df.to_csv(index=False).encode("utf-8-sig"),
+        history_df = pd.DataFrame([{
+            "รหัส": row.get("id"),
+            "วันที่บันทึก": pd.to_datetime(row.get("created_at"), errors="coerce").strftime("%Y-%m-%d %H:%M") if row.get("created_at") else "",
+            "โครงการ / โกดัง": row.get("site", ""),
+            "คะแนนเสี่ยง": row.get("risk_score", 0),
+            "สรุปความเสี่ยง": row.get("risk_label", ""),
+            "บันทึกเพิ่มเติม": row.get("notes", "") or ""
+        } for row in rows])
+        st.dataframe(history_df, hide_index=True, use_container_width=True)
+        st.download_button("ส่งออก CSV", history_df.to_csv(index=False).encode("utf-8-sig"),
                            file_name="warehouse-history.csv", mime="text/csv", use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("เปิดดูรายละเอียดรายการย้อนหลัง")
+        def history_label(row):
+            stamp = pd.to_datetime(row.get("created_at"), errors="coerce")
+            stamp_text = stamp.strftime("%Y-%m-%d %H:%M") if not pd.isna(stamp) else "ไม่ทราบวันที่"
+            return f'#{row.get("id")} · {row.get("site") or "ไม่ระบุชื่อ"} · {stamp_text}'
+        chosen = st.selectbox("เลือกโกดัง/รายการที่ต้องการดู", rows, format_func=history_label, key="history_detail_select")
+        if chosen:
+            st.markdown(f"### {chosen.get('site') or 'ไม่ระบุชื่อโครงการ / โกดัง'}")
+            stamp = pd.to_datetime(chosen.get("created_at"), errors="coerce")
+            if not pd.isna(stamp):
+                st.caption("วันที่บันทึก: " + stamp.strftime("%Y-%m-%d %H:%M"))
+            st.metric("คะแนนสัญญาณเสี่ยง", chosen.get("risk_score", 0), chosen.get("risk_label", ""))
+            if chosen.get("notes"):
+                st.markdown("**บันทึกเพิ่มเติม**")
+                st.write(chosen["notes"])
+
+            saved_points = chosen.get("points") or {}
+            saved_elevations = chosen.get("elevations_model_m") or {}
+            if isinstance(saved_points, dict) and any(saved_points.get(k) for k in "ABC"):
+                st.markdown("#### ตำแหน่ง A / B / C ที่บันทึกไว้")
+                map_points = [(k, saved_points[k]) for k in "ABC"
+                              if isinstance(saved_points.get(k), dict)
+                              and saved_points[k].get("lat") is not None
+                              and saved_points[k].get("lon") is not None]
+                if map_points:
+                    center = [sum(p["lat"] for _, p in map_points)/len(map_points),
+                              sum(p["lon"] for _, p in map_points)/len(map_points)]
+                    detail_map = folium.Map(location=center, zoom_start=15, control_scale=True)
+                    detail_colors = {"A": "blue", "B": "orange", "C": "green"}
+                    for k, p in map_points:
+                        label = f"{k} — {LABELS[k]}"
+                        folium.Marker([p["lat"], p["lon"]], tooltip=label,
+                                      popup=f"{label}<br>{p['lat']:.6f}, {p['lon']:.6f}",
+                                      icon=folium.Icon(color=detail_colors[k])).add_to(detail_map)
+                    st_folium(detail_map, height=300, use_container_width=True,
+                              key=f"history_map_{chosen.get('id')}", returned_objects=[])
+                    point_rows = []
+                    for k in "ABC":
+                        p = saved_points.get(k)
+                        if not isinstance(p, dict):
+                            continue
+                        elev = saved_elevations.get(k) if isinstance(saved_elevations, dict) else None
+                        point_rows.append({
+                            "จุด": k, "ตำแหน่ง": LABELS[k],
+                            "ละติจูด": p.get("lat"), "ลองจิจูด": p.get("lon"),
+                            "ความแม่นยำ GPS (ม.)": p.get("accuracy_m"),
+                            "ระดับภูมิประเทศโดยประมาณ (ม.)": elev
+                        })
+                    st.dataframe(pd.DataFrame(point_rows), hide_index=True, use_container_width=True)
+            else:
+                st.info("รายการนี้บันทึกไว้โดยไม่มีพิกัด A/B/C")
+
+            if isinstance(saved_elevations, dict) and all(saved_elevations.get(k) is not None for k in "ABC"):
+                st.markdown("#### ผลต่างระดับภูมิประเทศโดยประมาณ")
+                for title, delta in [
+                    ("B เทียบ A", float(saved_elevations["B"]) - float(saved_elevations["A"])),
+                    ("C เทียบ B", float(saved_elevations["C"]) - float(saved_elevations["B"])),
+                    ("C เทียบ A", float(saved_elevations["C"]) - float(saved_elevations["A"]))
+                ]:
+                    st.write(f"- {title}: {'สูงกว่า' if delta > 0 else 'ต่ำกว่า' if delta < 0 else 'ใกล้เคียง'} {abs(delta):.1f} ม. (แบบจำลองเท่านั้น)")
+            else:
+                st.info("รายการนี้ยังไม่มีค่าระดับภูมิประเทศที่คำนวณไว้ตอนบันทึก")
+
+            saved_checks = chosen.get("risk_checks") or {}
+            st.markdown("#### เช็กลิสต์สัญญาณเสี่ยงที่บันทึกไว้")
+            checked_items = [label for label, _ in CHECKS if isinstance(saved_checks, dict) and saved_checks.get(label)]
+            if checked_items:
+                for item in checked_items:
+                    st.write(f"- ✓ {item}")
+            else:
+                st.write("ไม่มีรายการที่เลือกไว้")
+            st.caption("ค่าระดับจากแบบจำลองภูมิประเทศไม่ใช่ระดับพื้นถนน/พื้นโกดังที่สำรวจจริง และไม่สามารถยืนยันส่วนต่างระดับ 10–50 ซม. ได้")
 
 with tab_how:
     st.markdown("""
